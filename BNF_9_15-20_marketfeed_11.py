@@ -5,22 +5,28 @@
 ╚══════════════════════════════════════════════════════════════╝
 
 Flow:
-  1. Wait for 9:20 AM → fetch 9:15 5-min BankNifty SPOT candle close
-  2. Calculate buy / sell levels using the sqrt formula
-  3. Monitor live spot price every tick:
-       • Spot >= Buy + 2  → BUY ATM CE
-       • Spot <= Sell - 2 → BUY ATM PE
-  4. Exit rules:
-       CE: exit when Spot >= T1  OR  CE_premium >= entry_premium + 25
-           SL: Spot <= S1 (market exit)
-       PE: exit when Spot <= S1  OR  PE_premium >= entry_premium + 25
-           SL: Spot >= T1 (market exit)
+  1. Wait for 9:15 AM (market open), then wait for chosen candle to fully close
+  2. Fetch the 5-min BankNifty SPOT candle close and calculate buy/sell levels
+     using the square-root formula
+  3. Start MarketFeed in a background thread; monitor live spot every second:
+       • Spot >= Buy + 2  → BUY ATM CE (long call)
+       • Spot <= Sell - 2 → BUY ATM PE (long put)
+  4. Once a position is open, check exit conditions every tick:
+       CE exits: Spot >= T1  OR  CE_premium >= entry_premium + 25  OR  Spot <= Sell (SL)
+       PE exits: Spot <= S1  OR  PE_premium >= entry_premium + 25  OR  Spot >= Buy  (SL)
+  5. Only one trade is allowed per session. After exit, bot prints summary and stops.
+  6. On Ctrl+C, EOD, or hard crash: the bot queries Dhan's live positions via
+     get_positions() before placing any sell. If the position was already closed
+     manually from the Dhan app (netQty == 0), no sell order is placed, preventing
+     an accidental short. Only if netQty > 0 does the bot place a market SELL to exit.
 
 Requirements:
     pip install dhanhq pandas python-dotenv
 
 Setup:
-    Copy .env.example → .env and fill in credentials.
+    Create a .env file in the script directory with:
+        DHAN_CLIENT_ID=your_client_id
+        DHAN_ACCESS_TOKEN=your_access_token
 """
 
 import asyncio
@@ -38,13 +44,18 @@ import pandas as pd
 from dhanhq import dhanhq, MarketFeed
 from dotenv import load_dotenv
 
-# Generate filename: bnf_YYYYMMDD_HHMMSS.out
+# ── Log file setup ─────────────────────────────────────────────────────────────
+# Every print() and log line is written to BOTH the terminal and a timestamped
+# .out file under run_log/ so the full session output is always saved to disk.
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_filename = "run_log/" + f"bnf_{timestamp}.out"
 
-# Tee: write every print() / sys.stdout write to BOTH the .out file and the
-# original console so output is visible in the terminal AND saved to file.
 class _Tee:
+    """
+    Duplicates every write to all given streams simultaneously.
+    Used to mirror stdout/stderr to both the terminal and the log file.
+    Silently ignores write errors during shutdown (e.g. when the file is closing).
+    """
     def __init__(self, *streams):
         self._streams = streams
 
@@ -55,7 +66,7 @@ class _Tee:
                     s.write(data)
                     s.flush()
             except Exception:
-                pass  # silently ignore write errors during shutdown
+                pass
 
     def flush(self):
         for s in self._streams:
@@ -72,20 +83,21 @@ _console_out = sys.stdout
 _console_err = sys.stderr
 log_file = open(log_filename, "w", encoding="utf-8")
 
+# Redirect stdout and stderr through the Tee so all output goes to terminal + file
 sys.stdout = _Tee(_console_out, log_file)
 sys.stderr = _Tee(_console_err, log_file)
 
-# --- Your job code below ---
 print("Job started...")
-# ...
 
 # ── Logging ───────────────────────────────────────────────────────────────────
+# Two handlers: StreamHandler writes to the Tee (terminal + .out file),
+# FileHandler writes a separate structured .log file under logs/.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
-        logging.StreamHandler(sys.stdout),          # goes to Tee → console + file
+        logging.StreamHandler(sys.stdout),
         logging.FileHandler(f"logs/bnf_bot_{timestamp}.log", encoding="utf-8"),
     ],
 )
@@ -94,15 +106,17 @@ log = logging.getLogger("BNBot")
 IST = ZoneInfo("Asia/Kolkata")
 
 # ── Credentials ───────────────────────────────────────────────────────────────
-# load_dotenv() searches: current working directory first, then the script's
-# own directory.  We explicitly try both so it works regardless of where you
-# launch the script from.
+# Searches for .env in three locations in order:
+#   1. Current working directory (wherever you ran `python` from)
+#   2. Same folder as this .py file
+#   3. Hardcoded fallback path (update if needed)
+# The first .env file found is loaded; the search stops there.
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _ENV_PATHS = [
-    os.path.join(os.getcwd(), ".env"),  # wherever you ran `python` from
-    os.path.join(_SCRIPT_DIR, ".env"),  # same folder as this .py file
-    "C:/Trading/AlgoTrading/.env"  # add .env file's path manually
+    os.path.join(os.getcwd(), ".env"),
+    os.path.join(_SCRIPT_DIR, ".env"),
+    "C:/Trading/AlgoTrading/.env"
 ]
 
 _loaded = False
@@ -140,8 +154,9 @@ if not CLIENT_ID or not ACCESS_TOKEN:
            "  (.env was found but DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN are missing or blank)\n")
     )
 
-# dhanhq v2 requires DhanContext(client_id, access_token) passed into dhanhq()
-# dhanhq v1 took dhanhq(client_id, access_token) directly
+# ── SDK initialisation ─────────────────────────────────────────────────────────
+# dhanhq v2 requires a DhanContext wrapper; v1 accepted credentials directly.
+# We try v2 first and fall back to v1 if DhanContext is not importable.
 try:
     from dhanhq import DhanContext
 
@@ -152,18 +167,16 @@ except ImportError:
     dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN)
     print("[INFO] dhanhq SDK v1 initialised.")
 
-# Get fund limits (account balance)
+# ── Account summary ────────────────────────────────────────────────────────────
+# Print key balance fields at startup so you can verify the correct account
+# is connected before any orders are placed.
 try:
     balance_info = dhan.get_fund_limits()
-
-    # Print the full response
-    # print(balance_info, "\n")
     print(f"\n Client ID : {balance_info['data']['dhanClientId']}")
     print(f" SOD Limit: {balance_info['data']['sodLimit']}")
     print(f" Collateral Amount : {balance_info['data']['collateralAmount']}")
     print(f" Available Balance: {balance_info['data']['availabelBalance']}")
     print(f" Utilized Amount: {balance_info['data']['utilizedAmount']} \n")
-
 except Exception as e:
     print(f"Error fetching balance: {e}")
 
@@ -171,23 +184,24 @@ except Exception as e:
 # CONSTANTS
 # ═════════════════════════════════════════════════════════════════════════════
 
-BANKNIFTY_SECURITY_ID   = "25"  # Dhan security ID for BANKNIFTY index
-BANKNIFTY_INDEX_EXCH    = "IDX_I"  # Exchange segment for index spot quote
-BANKNIFTY_FNO_EXCH      = "NSE_FNO"  # Exchange for F&O orders
+BANKNIFTY_SECURITY_ID   = "25"      # Dhan security ID for the BankNifty index
+BANKNIFTY_INDEX_EXCH    = "IDX_I"   # Exchange segment for index spot data
+BANKNIFTY_FNO_EXCH      = "NSE_FNO" # Exchange segment for F&O orders
 INSTRUMENT_INDEX        = "INDEX"
 INSTRUMENT_OPTIDX       = "OPTIDX"
 
-LOT_SIZE                = 30  # BankNifty lot size (verify current)
-POLL_INTERVAL_SEC       = 1  # Seconds between spot price polls
-PREMIUM_TARGET_POINTS   = 25  # Exit when premium gains 25 pts
-ENTRY_BUFFER            = 2  # Spot must be >= buy+2 or <= sell-2
+LOT_SIZE                = 30    # BankNifty lot size — verify before trading
+POLL_INTERVAL_SEC       = 1     # Seconds to sleep between each price poll
+PREMIUM_TARGET_POINTS   = 25    # Exit when option premium gains 25 pts from entry
+PREMIUM_STOPLOSS_POINTS = 25    # Exit when option premium gains 25 pts from entry
+ENTRY_BUFFER            = 1     # Extra buffer: enter CE only if spot >= buy+1, PE if spot <= sell-1
 ORDER_TYPE              = "MARKET"
-PRODUCT                 = "INTRADAY"  # or "CNC" / "MARGIN"
+PRODUCT                 = "INTRADAY"
 SUMMARY                 = ""
 
 # ── Candle time configuration ─────────────────────────────────────────────────
-# Set the 5-minute candle whose CLOSE you want to use for level calculation.
-# Change CANDLE_HOUR / CANDLE_MINUTE here — nothing else needs to be touched.
+# Controls which 5-minute BankNifty candle close is used to compute levels.
+# Only CANDLE_HOUR and CANDLE_MINUTE need to be changed — no other code changes.
 #
 #   Examples:
 #     9:15  → CANDLE_HOUR = 9,  CANDLE_MINUTE = 15   (market open candle)
@@ -195,25 +209,29 @@ SUMMARY                 = ""
 #    11:30  → CANDLE_HOUR = 11, CANDLE_MINUTE = 30
 #    14:00  → CANDLE_HOUR = 14, CANDLE_MINUTE = 0
 #
-# Rule: CANDLE_MINUTE must be a multiple of 5 and in range 0-55.
-# The bot will wait until (CANDLE_HOUR : CANDLE_MINUTE + 5) before fetching,
-# so the candle is guaranteed to be fully closed.
+# CANDLE_MINUTE must be a multiple of 5 (0, 5, 10, ... 55).
+# The bot waits until CANDLE_HOUR:(CANDLE_MINUTE + 5) before fetching,
+# ensuring the candle is fully closed.
 # ─────────────────────────────────────────────────────────────────────────────
 CANDLE_HOUR   = 9   # ← change this
 CANDLE_MINUTE = 15  # ← change this  (must be multiple of 5)
 
 """
-Architecture note (v10):
+Architecture — MarketFeed background thread:
 
- MarketFeed runs in a background daemon thread (_bg_feed_loop).
- The main trading loop reads prices from a shared dict (_ltp_prices)
- that the background thread updates on every incoming tick.
- This gives sub-second freshness with zero blocking in the main loop.
+  MarketFeed's run_forever() is a blocking WebSocket call. Running it directly
+  in the main loop would freeze the loop for seconds per call, causing large
+  gaps between price checks.
 
- Feed lifecycle:
-   _start_feed()          → called once at startup (spot only)
-   _start_feed(option_id) → called once at entry (adds option)
-   _stop_feed()           → called at session end / trade done
+  Instead, a single daemon thread runs run_forever() continuously in the
+  background (_bg_feed_loop). Every incoming tick is stored in _ltp_prices
+  (a dict protected by a threading.Lock). The main trading loop reads from
+  that dict instantly — no blocking, no delay, no repeated reconnects.
+
+  Feed lifecycle:
+    _start_feed()              → called at startup; subscribes to BankNifty spot only
+    _start_feed(option_id)     → called once after entry; rebuilds feed to add the option
+    _stop_feed()               → called after trade completes, on EOD, or on any exit
 """
 
 
@@ -222,24 +240,29 @@ Architecture note (v10):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def calculate_levels(cmp: float) -> dict:
-    """Square-root formula to compute buy / sell levels around CMP."""
+    """
+    Compute buy/sell/target/stop levels around the given CMP using the
+    square-root formula. Returns a dict with keys:
+      buy, t1, t2, t3  — upside levels (buy trigger and targets)
+      sell, s1, s2, s3 — downside levels (sell trigger and stops)
+    """
     r1 = math.floor(math.sqrt(cmp)) - 1
 
     def level(n: int) -> float:
         return round((r1 + n * 0.125) ** 2, 0)
 
-    buy_step = next(n for n in range(1, 200) if level(n) > cmp)
+    buy_step  = next(n for n in range(1, 200) if level(n) > cmp)
     sell_step = next(n for n in range(buy_step - 1, 0, -1) if level(n) < cmp)
 
     return {
-        "buy": level(buy_step),
-        "t1": level(buy_step + 1),
-        "t2": level(buy_step + 2),
-        "t3": level(buy_step + 3),
+        "buy":  level(buy_step),
+        "t1":   level(buy_step + 1),
+        "t2":   level(buy_step + 2),
+        "t3":   level(buy_step + 3),
         "sell": level(sell_step),
-        "s1": level(sell_step - 1),
-        "s2": level(sell_step - 2),
-        "s3": level(sell_step - 3),
+        "s1":   level(sell_step - 1),
+        "s2":   level(sell_step - 2),
+        "s3":   level(sell_step - 3),
     }
 
 
@@ -249,14 +272,13 @@ def calculate_levels(cmp: float) -> dict:
 
 def get_candle_close(hour: int = CANDLE_HOUR, minute: int = CANDLE_MINUTE) -> float:
     """
-    Fetch today's 5-min BankNifty candle for the given hour:minute and return its close.
-
-    To change which candle is used, update CANDLE_HOUR / CANDLE_MINUTE at the top
-    of this file — no other code needs to change.
+    Fetch today's 5-min BankNifty candle for the given hour:minute and return
+    its close price. Called twice per session: once at startup for level
+    calculation and once after trade completion for the end-of-trade summary.
 
     Args:
         hour   : candle start hour in IST   (default: CANDLE_HOUR)
-        minute : candle start minute in IST (default: CANDLE_MINUTE, must be multiple of 5)
+        minute : candle start minute in IST (default: CANDLE_MINUTE)
     """
     candle_label = f"{hour}:{minute:02d}"
     today_str = date.today().strftime("%Y-%m-%d")
@@ -271,8 +293,7 @@ def get_candle_close(hour: int = CANDLE_HOUR, minute: int = CANDLE_MINUTE) -> fl
         interval=5
     )
 
-    # intraday_minute_data returns dict directly (not nested under "data" in v2)
-    # Handle both v1 (resp["data"][...]) and v2 (resp directly has the lists)
+    # SDK v1 nests data under resp["data"]; v2 returns the lists at the top level
     if isinstance(resp, dict) and "data" in resp:
         data = resp["data"]
     else:
@@ -281,7 +302,7 @@ def get_candle_close(hour: int = CANDLE_HOUR, minute: int = CANDLE_MINUTE) -> fl
     if not data or not data.get("timestamp"):
         raise ValueError(f"Empty or unexpected candle response: {resp}")
 
-    # Timestamps: v2 returns epoch seconds (int); convert accordingly
+    # SDK v2 returns timestamps as epoch seconds (int); v1 may return ISO strings
     timestamps = data["timestamp"]
     try:
         ts_series = pd.to_datetime(timestamps, unit="s", utc=True)
@@ -290,9 +311,9 @@ def get_candle_close(hour: int = CANDLE_HOUR, minute: int = CANDLE_MINUTE) -> fl
 
     df = pd.DataFrame({
         "timestamp": ts_series,
-        "open": pd.to_numeric(data["open"], errors="coerce"),
-        "high": pd.to_numeric(data["high"], errors="coerce"),
-        "low": pd.to_numeric(data["low"], errors="coerce"),
+        "open":  pd.to_numeric(data["open"],  errors="coerce"),
+        "high":  pd.to_numeric(data["high"],  errors="coerce"),
+        "low":   pd.to_numeric(data["low"],   errors="coerce"),
         "close": pd.to_numeric(data["close"], errors="coerce"),
     })
 
@@ -305,12 +326,12 @@ def get_candle_close(hour: int = CANDLE_HOUR, minute: int = CANDLE_MINUTE) -> fl
         f"Range: {df.index[0].strftime('%H:%M')} → {df.index[-1].strftime('%H:%M')}"
     )
 
-    # Resample 1-min → 5-min (API returns 5-min bars; resample normalises any gaps)
+    # Resample to normalise any gaps in the returned 5-min bars
     df_5 = df.resample("5min", label="left", closed="left").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last"}
     ).dropna()
 
-    # Match by hour and minute directly — avoids any tz-offset mismatch
+    # Match by hour and minute to avoid timezone-offset edge cases
     target = None
     for ts in df_5.index:
         if ts.hour == hour and ts.minute == minute:
@@ -333,56 +354,39 @@ def get_candle_close(hour: int = CANDLE_HOUR, minute: int = CANDLE_MINUTE) -> fl
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# MARKETFEED — BACKGROUND THREAD ARCHITECTURE  (v10)
+# MARKETFEED — BACKGROUND THREAD
 # ═════════════════════════════════════════════════════════════════════════════
-#
-# ROOT CAUSE OF v9 SLOWNESS:
-#   run_forever() on Dhan's async MarketFeed is a BLOCKING call — it runs
-#   the WebSocket event loop until the connection drops, not "process one tick
-#   and return".  Calling it in a tight poll loop therefore blocks for ~10s
-#   per call while waiting for the socket.  With _MAX_EMPTY=3 that was
-#   3 × 10s = 30s minimum per poll cycle, causing the 30-second gaps in the
-#   log between every [BATCH] print.
-#
-# FIX — background thread design:
-#   A single daemon thread runs run_forever() continuously in the background.
-#   Every incoming tick is parsed and stored in _ltp_prices (a plain dict
-#   protected by a threading.Lock).  The main trading loop simply reads from
-#   that dict — it always gets the latest price with zero blocking, zero
-#   sleep, and zero 429 risk from repeated reconnects.
-#
-#   Subscribing a new instrument (e.g. an option after entry) triggers a
-#   clean feed rebuild: the background thread is stopped, a new MarketFeed
-#   with the expanded instrument list is created, and the thread restarts.
-#   This rebuild takes <2 seconds and happens at most once per session.
-# ─────────────────────────────────────────────────────────────────────────────
 
-_LTP_KEYS         = ("LTP", "last_price", "ltp")
-_ltp_prices: dict = {}          # sec_id (str) → float LTP, updated by bg thread
-_ltp_timestamps: dict = {}      # sec_id (str) → monotonic time of last update
+_LTP_KEYS         = ("LTP", "last_price", "ltp")  # accepted field names from Dhan tick
+_ltp_prices: dict = {}       # security_id (str) → latest float LTP, updated by bg thread
+_ltp_timestamps: dict = {}   # security_id (str) → monotonic time of last tick received
 _ltp_lock         = threading.Lock()
 
-_feed_instance        = None    # active MarketFeed object
-_feed_thread          = None    # background threading.Thread
-_feed_subscribed_ids  = set()   # security_ids in the current feed
-_feed_stop_event      = threading.Event()  # set to ask the bg thread to stop
+_feed_instance        = None   # currently active MarketFeed object
+_feed_thread          = None   # background daemon thread running the feed
+_feed_subscribed_ids  = set()  # set of security_ids the current feed is subscribed to
+_feed_stop_event      = threading.Event()  # signal to ask the bg thread to stop cleanly
 
-_MAX_429_RETRIES  = 5
-_BASE_BACKOFF_SEC = 5
+_MAX_429_RETRIES  = 5   # max retries when Dhan returns HTTP 429 (rate limit)
+_BASE_BACKOFF_SEC = 5   # initial back-off seconds; doubles on each retry (exponential)
+
+# Module-level reference to the Position object created in run_bot().
+# Assigned immediately when pos is created so that the __main__ finally block
+# can check whether this script has an open position on any hard exit or crash,
+# without needing to pass it through function arguments.
+_active_position: "Position | None" = None
 
 
 def _bg_feed_loop(feed: "MarketFeed", stop_event: threading.Event):
     """
-    Background thread: call run_forever() in a tight loop so the WebSocket
-    stays alive and every incoming tick is immediately stored in _ltp_prices.
+    Runs in a background daemon thread. Calls feed.run_forever() in a tight
+    loop to keep the WebSocket alive and process incoming ticks continuously.
 
-    run_forever() blocks until one of:
-      (a) a packet arrives and is processed  — returns quickly
-      (b) the connection drops               — we log and let the loop retry
-      (c) stop_event is set                  — we exit cleanly
+    Each tick is extracted from feed.get_data() and stored in _ltp_prices
+    so the main trading loop can read the latest price with no blocking.
 
-    We check stop_event before each call so the main thread can shut us down
-    without waiting for a blocking recv().
+    The loop exits cleanly when stop_event is set (triggered by _stop_feed()).
+    On unexpected errors it logs a warning and retries after a short pause.
     """
     global _ltp_prices, _ltp_timestamps
 
@@ -408,26 +412,28 @@ def _bg_feed_loop(feed: "MarketFeed", stop_event: threading.Event):
                         pass
         except Exception as exc:
             if stop_event.is_set():
-                break   # normal shutdown — ignore the error
+                break   # normal shutdown — suppress the error
             log.warning(f"[BG-FEED] tick error (will retry): {exc}")
-            time.sleep(0.5)   # brief pause before retrying
+            time.sleep(0.5)
 
 
 def _start_feed(option_security_id: str | None = None):
     """
-    Build a MarketFeed subscribed to BANKNIFTY spot + optional option,
-    then launch the background thread.
+    Build a MarketFeed subscribed to BankNifty spot and (optionally) an option,
+    then start the background thread.
 
-    Always include spot (security_id="25") and, when a position is open,
-    the option security_id as well.
+    Called twice per session:
+      1. At startup with no argument  → subscribes to spot only (security_id="25")
+      2. After a BUY signal           → rebuilds the feed to also include the option
 
-    WHY Quote INSTEAD OF Ticker:
-      Ticker fires only on matched trades — between trades the value is stale.
-      Quote fires on every bid/ask update AND trade, giving sub-second freshness.
+    Uses Quote subscription (not Ticker) so prices update on every bid/ask
+    change, not just on matched trades.
+
+    Retries up to _MAX_429_RETRIES times with exponential back-off if Dhan
+    returns a 429 rate-limit error on connect.
     """
     global _feed_instance, _feed_thread, _feed_subscribed_ids, _feed_stop_event
 
-    # Build instrument list
     instruments = [(MarketFeed.IDX, "25", MarketFeed.Quote)]
     if option_security_id:
         instruments.append(
@@ -435,14 +441,14 @@ def _start_feed(option_security_id: str | None = None):
         )
     requested_ids = {str(inst[1]) for inst in instruments}
 
-    # Already subscribed to exactly what we need → nothing to do
+    # Already subscribed to the exact same set — nothing to rebuild
     if requested_ids == _feed_subscribed_ids and _feed_thread and _feed_thread.is_alive():
         return
 
-    # ── Stop the existing background thread if running ────────────────────────
+    # Stop any existing feed before creating a new one
     _stop_feed()
 
-    # ── Create new MarketFeed with 429 back-off ───────────────────────────────
+    # Create new MarketFeed with exponential back-off on 429
     for attempt in range(_MAX_429_RETRIES):
         try:
             id_list = [inst[1] for inst in instruments]
@@ -466,29 +472,32 @@ def _start_feed(option_security_id: str | None = None):
             "Wait a few minutes and restart the bot."
         )
 
-    # ── Start background thread ───────────────────────────────────────────────
-    stop_evt           = threading.Event()
-    _feed_stop_event   = stop_evt
-    _feed_instance     = feed
+    stop_evt             = threading.Event()
+    _feed_stop_event     = stop_evt
+    _feed_instance       = feed
     _feed_subscribed_ids = requested_ids
 
     t = threading.Thread(
         target=_bg_feed_loop,
         args=(feed, stop_evt),
-        daemon=True,          # dies automatically when main thread exits
+        daemon=True,      # thread dies automatically when the main thread exits
         name="MarketFeedBG",
     )
     t.start()
     _feed_thread = t
 
-    # Give the feed ~2 seconds to receive the first ticks before the caller reads
+    # Allow 2 seconds for the first ticks to arrive before the caller reads prices
     log.info("MarketFeed background thread started. Warming up (2s) ...")
     time.sleep(2)
     log.info(f"Feed ready. Prices so far: { {k: v for k, v in _ltp_prices.items()} }")
 
 
 def _stop_feed():
-    """Signal the background thread to stop and wait for it to finish."""
+    """
+    Signal the background feed thread to stop, wait for it to finish,
+    disconnect the WebSocket, and cancel any leftover asyncio tasks
+    to prevent 'Task was destroyed but it is pending!' warnings.
+    """
     global _feed_instance, _feed_thread, _feed_subscribed_ids, _feed_stop_event
 
     if _feed_stop_event is not None:
@@ -502,9 +511,7 @@ def _stop_feed():
             _feed_instance.disconnect()
         except Exception:
             pass
-        # Cancel any pending asyncio tasks (e.g. websockets keepalive) left
-        # behind in the feed's event loop to suppress the warning:
-        # "Task was destroyed but it is pending!"
+        # Cancel pending asyncio tasks left in the feed's event loop
         try:
             loop = getattr(_feed_instance, "_loop", None)
             if loop is None:
@@ -521,7 +528,7 @@ def _stop_feed():
                         asyncio.gather(*pending, return_exceptions=True)
                     )
         except Exception:
-            pass  # best-effort — never let cleanup crash the bot
+            pass  # best-effort cleanup — never let this crash the bot
 
     _feed_instance       = None
     _feed_thread         = None
@@ -531,15 +538,14 @@ def _stop_feed():
 
 def _read_ltp(security_id: str, max_age_sec: float = 10.0) -> float:
     """
-    Read the latest LTP for a security_id from the shared price dict.
+    Read the latest LTP for a given security_id from the shared price dict.
 
     Raises RuntimeError if:
-      • No price has ever been received for this id, OR
-      • The last received price is older than max_age_sec
-        (feed may be stalled / disconnected).
+      - No price has ever been received for this security_id (feed still warming up), OR
+      - The most recent price is older than max_age_sec (feed may be stalled)
 
-    max_age_sec=10 is conservative — at Quote subscription level the index
-    updates multiple times per second during market hours.
+    max_age_sec=10 is intentionally conservative — at Quote level the BankNifty
+    index updates multiple times per second during market hours.
     """
     with _ltp_lock:
         price = _ltp_prices.get(str(security_id))
@@ -570,9 +576,9 @@ def get_live_spot() -> float:
 
 def get_spot_and_option_ltp(security_id: str) -> tuple[float, float]:
     """
-    Return (spot_ltp, option_ltp) — both read instantly from the shared
-    price dict maintained by the background feed thread.
-    No blocking, no WebSocket call, no 429 risk.
+    Return (spot_ltp, option_ltp) read instantly from the shared price dict.
+    Both values are updated continuously by the background feed thread,
+    so this call never blocks and carries no 429 risk.
     """
     spot = _read_ltp("25")
     opt  = _read_ltp(str(security_id))
@@ -585,7 +591,17 @@ def get_spot_and_option_ltp(security_id: str) -> tuple[float, float]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def get_atm_option(spot: float, option_type: str) -> dict:
+    """
+    Fetch the nearest-expiry BankNifty option chain and return the ATM
+    (or slightly ITM) contract for the requested option_type ("CE" or "PE").
 
+    Strike selection:
+      - Round spot to nearest 100 to get the base ATM strike.
+      - For CE: if rounded strike is above spot, step down 100 (ITM side).
+      - For PE: if rounded strike is below spot, step up  100 (ITM side).
+
+    Returns a dict with: security_id, strike, expiry, symbol.
+    """
     # print(f"\n Spot : {spot}")
     bf_all_exp = dhan.expiry_list(25, "IDX_I")
     bf_latest_exp = bf_all_exp["data"]["data"][0]
@@ -613,28 +629,27 @@ def get_atm_option(spot: float, option_type: str) -> dict:
 
     oc = chain_data.get("oc", {})
 
-    # Uncomment below line for debugging the code:
-
-    #  print(list(oc.keys())[:10])  # see exact format
+    # Uncomment below lines for debugging the option chain structure:
+    #  print(list(oc.keys())[:10])
     #  print(f"Looking for: {atm_strike}, type: {type(atm_strike)} \n\n ")
-    #  print(list(oc.keys())[:5],"\n")        # should show strike prices
-    #  print(list(oc.values())[:1],"\n\n")      # should show CE/PE data per strike
-
+    #  print(list(oc.keys())[:5],"\n")
+    #  print(list(oc.values())[:1],"\n\n")
     #  print("type(chain_data):\n")
-    # print(type(chain_data))
+    #  print(type(chain_data))
     #  print("\n\nlist(chain_data.keys())[:5]\n")
-    #  print(list(chain_data.keys())[:5])  # see the keys
+    #  print(list(chain_data.keys())[:5])
     #  print("\n\nlist(chain_data.values())[:1]\n")
-    #  print(list(chain_data.values())[:1])  # see the structure of one entry
+    #  print(list(chain_data.values())[:1])
 
     if not chain_data:
         raise ValueError("Empty option chain.")
 
-    # Direct lookup using exact key format
-    strike_key = f"{float(atm_strike):.6f}"  # → "53400.000000"
+    # Dhan's option chain uses float-formatted strike keys, e.g. "53400.000000"
+    strike_key  = f"{float(atm_strike):.6f}"
     strike_data = oc.get(strike_key, {})
 
-    contract = strike_data.get(option_type.lower())  # "CE" → "ce", "PE" → "pe"
+    # option_type "CE" maps to key "ce", "PE" maps to key "pe"
+    contract = strike_data.get(option_type.lower())
 
     if contract:
         log.info(
@@ -644,9 +659,9 @@ def get_atm_option(spot: float, option_type: str) -> dict:
         )
         return {
             "security_id": str(contract["security_id"]),
-            "strike": atm_strike,
-            "expiry": bf_latest_exp,
-            "symbol": contract.get("tradingSymbol", ""),
+            "strike":      atm_strike,
+            "expiry":      bf_latest_exp,
+            "symbol":      contract.get("tradingSymbol", ""),
         }
 
     log.warning(f"ATM {option_type} not found for strike={atm_strike} in option chain.")
@@ -657,13 +672,12 @@ def get_atm_option(spot: float, option_type: str) -> dict:
 # ORDER MANAGEMENT
 # ═════════════════════════════════════════════════════════════════════════════
 
-# ── Order helpers ─────────────────────────────────────────────────────────────
-# dhanhq v2 uses plain strings for transaction_type / order_type / product_type.
-# dhanhq v1 used class constants (dhan.BUY, dhan.MARKET, dhan.INTRADAY).
-# We use strings here — they work on both versions.
-
 def _place_order(security_id: str, txn_type: str) -> str:
-    #Internal: place a MARKET INTRADAY order and return order_id.
+    """
+    Internal helper: place a MARKET INTRADAY order on NSE_FNO and return
+    the order_id. txn_type must be "BUY" or "SELL".
+    Raises RuntimeError if Dhan returns a non-success status.
+    """
     resp = dhan.place_order(
         security_id      = security_id,
         exchange_segment = dhan.NSE_FNO,
@@ -680,15 +694,72 @@ def _place_order(security_id: str, txn_type: str) -> str:
 
 
 def place_buy_order(security_id: str, symbol: str) -> str:
-    """Place a market BUY order and return the order_id."""
+    """Place a market BUY (entry) order and return the order_id."""
     log.info(f"Placing BUY order → {symbol} ({security_id}), qty={LOT_SIZE}")
     order_id = _place_order(security_id, "BUY")
     log.info(f"BUY order placed. order_id={order_id}")
     return order_id
 
 
+def has_open_long_on_exchange(security_id: str) -> bool:
+    """
+    Query Dhan's live positions via get_positions() and check whether this
+    script's option still has an open long (netQty > 0).
+
+    This is the key safety check that prevents accidental short sells:
+    if the position was manually closed from the Dhan app before this script
+    triggers its own exit, netQty will be 0 and this function returns False,
+    causing place_sell_order() to skip the sell entirely.
+
+    netQty field per Dhan API docs:
+      > 0  → still long (position open)
+      = 0  → flat (position already closed, manually or by a prior exit)
+      < 0  → short (should never occur in this script's flow)
+
+    On API call failure, returns True (assumes position is open) so the bot
+    still attempts the exit rather than silently skipping it.
+    """
+    try:
+        resp = dhan.get_positions()
+        positions = []
+        if isinstance(resp, dict):
+            positions = resp.get("data") or resp.get("positions") or []
+        elif isinstance(resp, list):
+            positions = resp
+
+        for p in positions:
+            pid = str(p.get("securityId", p.get("security_id", "")))
+            if pid != str(security_id):
+                continue
+            # netQty confirmed as the correct field name per Dhan API documentation
+            net_qty = int(p.get("netQty", 0))
+            if net_qty > 0:
+                return True
+        return False
+
+    except Exception as e:
+        log.error(f"has_open_long_on_exchange check failed: {e}. Assuming position is open.")
+        return True
+
+
 def place_sell_order(security_id: str, symbol: str, reason: str) -> str:
-    """Place a market SELL (exit) order."""
+    """
+    Place a market SELL (exit) order — but ONLY after confirming via
+    has_open_long_on_exchange() that an open long still exists on the exchange.
+
+    If netQty == 0 (position already closed manually from the Dhan app or
+    another terminal), the sell is skipped and an empty string is returned.
+    This prevents creating an accidental naked short.
+
+    All exit paths (T1, SL, premium target, Ctrl+C, EOD, hard crash) call
+    this function, so the exchange check applies uniformly everywhere.
+    """
+    if not has_open_long_on_exchange(security_id):
+        log.warning(
+            f"EXIT [{reason}] skipped — no open long found on exchange for "
+            f"{symbol} ({security_id}). Position may have been closed manually."
+        )
+        return ""
     log.info(f"EXIT [{reason}] → {symbol} ({security_id}), qty={LOT_SIZE}")
     order_id = _place_order(security_id, "SELL")
     log.info(f"SELL order placed. order_id={order_id}")
@@ -700,29 +771,46 @@ def place_sell_order(security_id: str, symbol: str, reason: str) -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 
 class Position:
+    """
+    Tracks the state of the single trade this script is allowed per session.
+
+    active       : True while a BUY order has been placed and not yet exited
+    option_type  : "CE" or "PE"
+    security_id  : Dhan security_id of the option contract
+    symbol       : trading symbol (e.g. BANKNIFTY2561050000CE)
+    entry_premium: option LTP at the time of entry
+    entry_spot   : BankNifty spot at the time of entry
+    entry_time   : IST time string when the position was opened
+
+    Note: active is a local in-memory flag only. It does NOT reflect real-time
+    exchange state. Use has_open_long_on_exchange() before placing any SELL to
+    verify the position is still open on Dhan's side.
+    """
     def __init__(self):
-        self.active: bool = False
-        self.option_type: str = ""  # "CE" or "PE"
-        self.security_id: str = ""
-        self.symbol: str = ""
+        self.active: bool         = False
+        self.option_type: str     = ""  # "CE" or "PE"
+        self.security_id: str     = ""
+        self.symbol: str          = ""
         self.entry_premium: float = 0.0
-        self.entry_spot: float = 0.0
-        self.entry_time: str = ""
+        self.entry_spot: float    = 0.0
+        self.entry_time: str      = ""
 
     def open(self, option_type, security_id, symbol, premium, spot):
-        self.active = True
-        self.option_type = option_type
-        self.security_id = security_id
-        self.symbol = symbol
+        """Mark the position as open and record all entry details."""
+        self.active        = True
+        self.option_type   = option_type
+        self.security_id   = security_id
+        self.symbol        = symbol
         self.entry_premium = premium
-        self.entry_spot = spot
-        self.entry_time = datetime.now(IST).strftime("%H:%M:%S")
+        self.entry_spot    = spot
+        self.entry_time    = datetime.now(IST).strftime("%H:%M:%S")
         log.info(
             f"Position OPENED | {option_type} | {symbol} | "
             f"entry_premium={premium} | spot={spot}"
         )
 
     def close(self):
+        """Mark the position as closed in local state."""
         self.active = False
         log.info(f"Position CLOSED | {self.option_type} | {self.symbol}")
 
@@ -738,6 +826,7 @@ class Position:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def print_levels(levels: dict, close: float, candle_label: str = None):
+    """Print a formatted table of buy/sell levels and targets to the console."""
     if candle_label is None:
         candle_label = f"{CANDLE_HOUR}:{CANDLE_MINUTE:02d}"
     w = 46
@@ -758,20 +847,20 @@ def print_levels(levels: dict, close: float, candle_label: str = None):
 
 def wait_until_candle_ready(hour: int = CANDLE_HOUR, minute: int = CANDLE_MINUTE):
     """
-    Block until 5 minutes after the chosen candle's start time, so the candle
-    is fully closed before we fetch it.
+    Block until 5 minutes after the candle's start time so the candle is
+    fully closed before it is fetched.
 
-    Example: CANDLE_HOUR=9, CANDLE_MINUTE=15  → waits until 9:20 AM IST
-             CANDLE_HOUR=10, CANDLE_MINUTE=0  → waits until 10:05 AM IST
+    Examples:
+      CANDLE_HOUR=9,  CANDLE_MINUTE=15 → waits until 9:20 IST
+      CANDLE_HOUR=10, CANDLE_MINUTE=0  → waits until 10:05 IST
     """
     now = datetime.now(IST)
 
-    # Candle closes at (hour : minute + 5); add 5 min to the start
     ready_minute = minute + 5
     ready_hour   = hour + ready_minute // 60
     ready_minute = ready_minute % 60
 
-    target = now.replace(hour=ready_hour, minute=ready_minute, second=0, microsecond=0)
+    target       = now.replace(hour=ready_hour, minute=ready_minute, second=0, microsecond=0)
     candle_label = f"{hour}:{minute:02d}"
     ready_label  = f"{ready_hour}:{ready_minute:02d}"
 
@@ -787,7 +876,7 @@ def wait_until_candle_ready(hour: int = CANDLE_HOUR, minute: int = CANDLE_MINUTE
 
 
 def wait_until_market_open():
-    """Block until 9:15 AM IST (exchange open)."""
+    """Block until 9:15 AM IST when the NSE exchange opens."""
     now = datetime.now(IST)
     target = now.replace(hour=9, minute=15, second=0, microsecond=0)
     if now < target:
@@ -797,6 +886,7 @@ def wait_until_market_open():
 
 
 def is_market_open() -> bool:
+    """Return True if current IST time is within the trading window (9:15–15:25)."""
     now = datetime.now(IST)
     print(now)
 
@@ -817,12 +907,12 @@ def run_bot():
     log.info(f"  Candle time : {candle_label} (5-min close used for levels)")
     log.info("══════════════════════════════════════════")
 
-    # ── Step 1: Wait for market open, then for chosen candle to close ─────────
+    # ── Step 1: Wait for market open, then for chosen candle to fully close ───
     wait_until_market_open()
     wait_until_candle_ready(CANDLE_HOUR, CANDLE_MINUTE)
 
-    # ── Step 2: Fetch candle & compute levels ──────────────────────────────────
-    close = get_candle_close(CANDLE_HOUR, CANDLE_MINUTE)
+    # ── Step 2: Fetch candle close and compute buy/sell levels ─────────────────
+    close  = get_candle_close(CANDLE_HOUR, CANDLE_MINUTE)
     levels = calculate_levels(close)
 
     print_levels(levels, close, candle_label)
@@ -832,14 +922,16 @@ def run_bot():
 
     log.info(f"Entry triggers → CE if spot >= {buy_trigger} | PE if spot <= {sell_trigger}")
 
-    # ── Step 3: Start background MarketFeed (spot only) ───────────────────────
-    # Feed runs in a daemon thread — the main loop reads prices instantly with
-    # no blocking.  We rebuild the feed once after entry to add the option.
-    _start_feed()   # spot only to begin with
+    # ── Step 3: Start MarketFeed background thread (spot only) ────────────────
+    # The feed runs continuously in a daemon thread. After entry the feed is
+    # rebuilt once to include the option. Main loop reads prices with no blocking.
+    _start_feed()
 
     # ── Step 4: Main monitoring loop ───────────────────────────────────────────
+    global _active_position
     pos = Position()
-    trade_done = False  # one trade per session
+    _active_position = pos   # expose to __main__ finally block and signal handlers
+    trade_done = False       # only one trade is allowed per session
 
     while is_market_open():
         try:
@@ -850,13 +942,13 @@ def run_bot():
 
             time.sleep(1)
 
-            # ── No position: look for entry ────────────────────────────────────
+            # ── No open position: wait for a breakout entry signal ─────────────
             if not pos.active and not trade_done:
 
                 if spot >= buy_trigger:
                     log.info(f"BUY SIGNAL: spot {spot} >= {buy_trigger}")
                     option = get_atm_option(spot, "CE")
-                    # Rebuild feed to add option — takes ~2s, happens once only
+                    # Rebuild feed to include the option — takes ~2s, happens once only
                     _start_feed(option_security_id=option["security_id"])
                     spot, premium = get_spot_and_option_ltp(option["security_id"])
                     place_buy_order(option["security_id"], option["symbol"])
@@ -866,7 +958,7 @@ def run_bot():
                 elif spot <= sell_trigger:
                     log.info(f"SELL SIGNAL: spot {spot} <= {sell_trigger}")
                     option = get_atm_option(spot, "PE")
-                    # Rebuild feed to add option — takes ~2s, happens once only
+                    # Rebuild feed to include the option — takes ~2s, happens once only
                     _start_feed(option_security_id=option["security_id"])
                     spot, premium = get_spot_and_option_ltp(option["security_id"])
                     place_buy_order(option["security_id"], option["symbol"])
@@ -879,18 +971,26 @@ def run_bot():
                         f"| CE trigger>={buy_trigger} | PE trigger<={sell_trigger}"
                     )
 
-            # ── Active CE position: check exits ───────────────────────────────
+            # ── Active CE position: monitor exit conditions ────────────────────
+            # Exits (in priority order):
+            #   1. Spot >= T1           → target hit (spot-based)
+            #   2. Premium >= entry+25  → premium target hit
+            #   3. Spot <= Sell level   → stop-loss hit
+            # Before each sell, has_open_long_on_exchange() verifies the position
+            # is still open on Dhan. If closed manually, the sell is skipped.
             elif pos.active and pos.option_type == "CE":
                 target_prem = pos.entry_premium + PREMIUM_TARGET_POINTS
+                sl_prem = pos.entry_premium - PREMIUM_STOPLOSS_POINTS
                 prem_mtm = prem - pos.entry_premium
                 spot_mtm = spot - pos.entry_spot
                 log.info(
                     f"CE | spot={spot:.2f} | prem={prem:.2f} "
-                    f"| entry_prem={pos.entry_premium:.2f} "
-                    f"| target_prem={target_prem:.2f} "
+                    f"| entr_prem={pos.entry_premium:.2f} "
+                    f"| tgt_prem={target_prem:.2f} "
+                    f"| sl_prem={sl_prem:.2f} "
                     f"| T1={levels['t1']} | SL_spot={levels['sell']}"
-                    f"| Premium MTM={prem_mtm:.2f} "
                     f"| Spot MTM ={spot_mtm:.2f} "
+                    f"| Prem MTM={prem_mtm:.2f} "
                 )
 
                 if spot >= levels["t1"]:
@@ -901,6 +1001,7 @@ def run_bot():
                     pos.close(); trade_done = True
                     print("\n\n Points earned in Spot=",  spot - pos.entry_spot)
                     print("\n Points earned in premium=", round(prem, 2) - round(pos.entry_premium, 2), "\n")
+                    print("\n Total Profit =", LOT_SIZE * (round(prem, 2) - round(pos.entry_premium, 2)), "\n")
 
                 elif prem >= target_prem:
                     place_sell_order(pos.security_id, pos.symbol, f"Premium target ({target_prem:.2f})")
@@ -910,6 +1011,7 @@ def run_bot():
                     pos.close(); trade_done = True
                     print("\n\n Points earned in Spot=",  spot - pos.entry_spot)
                     print("\n Points earned in premium=", round(prem, 2) - round(pos.entry_premium, 2), "\n")
+                    print("\n Total Profit =", LOT_SIZE * (round(prem, 2) - round(pos.entry_premium, 2)), "\n")
 
                 elif spot <= levels["sell"]:
                     place_sell_order(pos.security_id, pos.symbol, f"SL hit (S1={levels['sell']})")
@@ -919,19 +1021,38 @@ def run_bot():
                     pos.close(); trade_done = True
                     print("\n\n Points BURNED in Spot=",  spot - pos.entry_spot)
                     print("\n Points BURNED in premium=", round(prem, 2) - round(pos.entry_premium, 2), "\n")
+                    print("\n Total Loss =", LOT_SIZE*(round(prem, 2) - round(pos.entry_premium, 2)), "\n")
 
-            # ── Active PE position: check exits ───────────────────────────────
+                elif prem <= sl_prem:
+                    place_sell_order(pos.security_id, pos.symbol, f"Premium SL Hit ({sl_prem:.2f})")
+                    print(
+                        f"\n\n[CE EXIT - SL Hit]  Entry Spot={pos.entry_spot:.2f}  Exit Spot={spot:.2f}"
+                        f"  |  Entry Premium={pos.entry_premium:.2f}  Exit Premium={prem:.2f}\n")
+                    pos.close(); trade_done = True
+                    print("\n\n Points BURNED in Spot=",  spot - pos.entry_spot)
+                    print("\n Points BURNED in premium=", round(prem, 2) - round(pos.entry_premium, 2), "\n")
+                    print("\n Total Loss =", LOT_SIZE*(round(prem, 2) - round(pos.entry_premium, 2)), "\n")
+
+            # ── Active PE position: monitor exit conditions ────────────────────
+            # Exits (in priority order):
+            #   1. Spot <= S1           → target hit (spot-based)
+            #   2. Premium >= entry+25  → premium target hit
+            #   3. Spot >= Buy level    → stop-loss hit
+            # Before each sell, has_open_long_on_exchange() verifies the position
+            # is still open on Dhan. If closed manually, the sell is skipped.
             elif pos.active and pos.option_type == "PE":
                 target_prem = pos.entry_premium + PREMIUM_TARGET_POINTS
+                sl_prem = pos.entry_premium - PREMIUM_STOPLOSS_POINTS
                 prem_mtm = prem - pos.entry_premium
                 spot_mtm = pos.entry_spot - spot
                 log.info(
                     f"PE | spot={spot:.2f} | prem={prem:.2f} "
-                    f"| entry_prem={pos.entry_premium:.2f} "
-                    f"| target_prem={target_prem:.2f} "
+                    f"| entr_prem={pos.entry_premium:.2f} "
+                    f"| tgt_prem={target_prem:.2f} "
+                    f"| sl_prem={sl_prem:.2f} "
                     f"| S1={levels['s1']} | SL_spot={levels['buy']}"
-                    f"| Premium MTM={prem_mtm:.2f} "
                     f"| Spot MTM ={spot_mtm:.2f} "
+                    f"| Prem MTM={prem_mtm:.2f} "
                 )
 
                 if spot <= levels["s1"]:
@@ -942,6 +1063,7 @@ def run_bot():
                     pos.close(); trade_done = True
                     print("\n\n Points earned in Spot=",  pos.entry_spot - spot)
                     print("\n Points earned in premium=", round(prem, 2) - round(pos.entry_premium, 2), "\n")
+                    print("\n Total Profit =", LOT_SIZE * (round(prem, 2) - round(pos.entry_premium, 2)), "\n")
 
                 elif prem >= target_prem:
                     place_sell_order(pos.security_id, pos.symbol, f"Premium target ({target_prem:.2f})")
@@ -951,6 +1073,7 @@ def run_bot():
                     pos.close(); trade_done = True
                     print("\n\n Points earned in Spot=",  pos.entry_spot - spot)
                     print("\n Points earned in premium=", round(prem, 2) - round(pos.entry_premium, 2), "\n")
+                    print("\n Total Profit =", LOT_SIZE * (round(prem, 2) - round(pos.entry_premium, 2)), "\n")
 
                 elif spot >= levels["buy"]:
                     place_sell_order(pos.security_id, pos.symbol, f"SL hit (T1={levels['buy']})")
@@ -960,12 +1083,28 @@ def run_bot():
                     pos.close(); trade_done = True
                     print("\n\n Points BURNED in Spot=",  pos.entry_spot - spot)
                     print("\n Points BURNED in premium=", round(prem, 2) - round(pos.entry_premium, 2), "\n")
+                    print("\n Total Loss =", LOT_SIZE*(round(prem, 2) - round(pos.entry_premium, 2)), "\n")
+
+                elif prem <= sl_prem:
+                    place_sell_order(pos.security_id, pos.symbol, f"Premium SL Hit ({sl_prem:.2f})")
+                    print(
+                        f"\n\n[PE EXIT - SL Hit]  Entry Spot={pos.entry_spot:.2f}  Exit Spot={spot:.2f}"
+                        f"  |  Entry Premium={pos.entry_premium:.2f}  Exit Premium={prem:.2f}\n")
+                    pos.close(); trade_done = True
+                    print("\n\n Points BURNED in Spot=",  spot - pos.entry_spot)
+                    print("\n Points BURNED in premium=", round(prem, 2) - round(pos.entry_premium, 2), "\n")
+                    print("\n Total Loss =", LOT_SIZE*(round(prem, 2) - round(pos.entry_premium, 2)), "\n")
 
         except KeyboardInterrupt:
-            log.info("Manual interrupt received.")
+            log.info("Manual interrupt received (Ctrl+C).")
             if pos.active:
-                log.warning("Closing open position before exit ...")
+                # Verify position is still open on exchange before selling.
+                # If it was already closed manually via the Dhan app, the sell is skipped.
+                log.warning("Checking exchange and closing position if still open ...")
                 place_sell_order(pos.security_id, pos.symbol, "Manual interrupt")
+                pos.close()
+            else:
+                log.info("No open position from this script — no sell order placed.")
             break
 
         except Exception as exc:
@@ -980,17 +1119,23 @@ def run_bot():
         else:
             time.sleep(POLL_INTERVAL_SEC)
 
-    # ── End-of-day: square off any open position ───────────────────────────────
+    # ── End-of-day square-off ──────────────────────────────────────────────────
+    # Reached when is_market_open() returns False (after 15:25 IST).
+    # If pos.active is True the bot never received a normal exit signal,
+    # so it attempts to square off. The sell is only placed if Dhan confirms
+    # netQty > 0; if the position was closed manually it is silently skipped.
     _stop_feed()
     if pos.active:
-        log.warning("Market closing. Squaring off open position.")
+        log.warning("Market closing. Attempting EOD square-off ...")
         try:
             place_sell_order(pos.security_id, pos.symbol, "EOD square-off")
+            pos.close()
         except Exception as e:
             log.error(f"EOD square-off failed: {e}")
+    else:
+        log.info("EOD: no open position from this script — no sell order placed.")
 
     log.info("Bot session complete.")
-# At the end (optional, Python closes on exit anyway)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1001,10 +1146,28 @@ if __name__ == "__main__":
     try:
         run_bot()
     finally:
+        # Hard-exit safety net: catches unhandled exceptions, sys.exit(), or
+        # any other path that bypasses the normal loop exit.
+        # Checks _active_position (set by run_bot) to decide whether a sell
+        # is needed. Calls place_sell_order() which internally verifies
+        # netQty > 0 on exchange, so no accidental short is ever created.
         _stop_feed()
+        if _active_position is not None and _active_position.active:
+            log.warning("Hard exit detected: attempting to close open position ...")
+            try:
+                place_sell_order(
+                    _active_position.security_id,
+                    _active_position.symbol,
+                    "Hard exit (finally block)",
+                )
+                _active_position.close()
+            except Exception as e:
+                log.error(f"Hard-exit square-off failed: {e}")
+        else:
+            log.info("Hard exit: no open position from this script — no sell order placed.")
         if _feed_thread and _feed_thread.is_alive():
-            _feed_thread.join(timeout=3)   # wait up to 3s for clean exit
-        # restore stdout/stderr before closing the log
+            _feed_thread.join(timeout=3)
+        # Restore original stdout/stderr before closing the log file
         sys.stdout = _console_out
         sys.stderr = _console_err
         log_file.close()
